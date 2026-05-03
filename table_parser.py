@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import json
 import re
 from dataclasses import dataclass
@@ -12,7 +14,7 @@ HEADER_PREFIX = "\t Вид"
 DATA_ROW_PREFIX = "РМ"
 ANONYMIZED_DATA_ROW_PREFIX = "AA"
 SPECIAL_SEPARATOR_INDEX = 2
-TABLE_GAP = 4
+TABLE_GAP = 2
 MIN_HEADER_TABS = 2
 TAB_RUN_RE = re.compile(r"\t+")
 DEFAULT_TEXT_ENCODINGS = ("utf-8-sig", "cp1251", "cp1252")
@@ -92,8 +94,29 @@ def read_text_file(path: str | Path, encoding: str | None = None) -> str:
 
 def read_table_text(path: str | Path, encoding: str | None = None) -> str:
     text = read_text_file(path, encoding=encoding)
+    text = decode_base64_text_if_needed(text)
     if "\n" not in text and ("\\n" in text or "\\t" in text):
         text = text.replace("\\n", "\n").replace("\\t", "\t")
+    return text
+
+
+def decode_base64_text_if_needed(text: str) -> str:
+    if "\t" in text or "\\t" in text:
+        return text
+
+    compact = "".join(text.split())
+    if not compact:
+        return text
+
+    try:
+        decoded_bytes = base64.b64decode(compact, validate=True)
+        decoded = decoded_bytes.decode("utf-8-sig")
+    except (binascii.Error, UnicodeDecodeError):
+        return text
+
+    if "\t" in decoded or "\\t" in decoded:
+        return decoded
+
     return text
 
 
@@ -110,8 +133,11 @@ def is_header_row(row: PhysicalRow) -> bool:
 
 def is_data_row(raw: str, allow_anonymized_prefix: bool = False) -> bool:
     text = raw.lstrip("\t ")
+    first_cell = text.split("\t", 1)[0]
     return text.startswith(DATA_ROW_PREFIX) or (
-        allow_anonymized_prefix and text.startswith(ANONYMIZED_DATA_ROW_PREFIX)
+        allow_anonymized_prefix
+        and first_cell.startswith(ANONYMIZED_DATA_ROW_PREFIX)
+        and any(ch.isdigit() for ch in first_cell)
     )
 
 

@@ -56,11 +56,11 @@ class TableParserTests(unittest.TestCase):
     def test_parses_anonymized_reference_shape(self) -> None:
         result = parse_document(read_table_text(Path("table_format.txt")))
 
-        self.assertEqual(len(result.tables), 2)
-        self.assertEqual(result.tables[0].header_line_number, 3)
-        self.assertEqual(result.tables[1].header_line_number, 131)
-        self.assertEqual(len(result.tables[0].rows), 60)
-        self.assertEqual(len(result.tables[1].rows), 6)
+        self.assertEqual(len(result.tables), 3)
+        self.assertEqual([table.header_line_number for table in result.tables], [2, 66, 130])
+        self.assertEqual([len(table.rows) for table in result.tables], [60, 60, 15])
+        self.assertEqual([len(table.header) for table in result.tables], [21, 21, 21])
+        self.assertFalse(any(row.issues for table in result.tables for row in table.rows))
 
     def test_read_table_text_handles_utf8_bom_and_cp1251_files(self) -> None:
         with TemporaryDirectory() as tmpdir:

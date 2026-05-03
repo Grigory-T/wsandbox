@@ -1,4 +1,6 @@
+import csv
 import io
+import json
 import unittest
 from contextlib import redirect_stdout
 from importlib.util import find_spec
@@ -6,7 +8,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from table_parser import parse_document, parse_folder, parse_tables_to_dataframes, read_table_text
+from table_parser import (
+    parse_document,
+    parse_folder,
+    parse_folder_fast,
+    parse_tables_to_dataframes,
+    read_table_text,
+)
 
 
 class TableParserTests(unittest.TestCase):
@@ -191,6 +199,70 @@ class TableParserTests(unittest.TestCase):
             ],
         )
         self.assertEqual(result.dataframes[0].loc[0, "source_file"], "good.txt")
+
+    @unittest.skipIf(find_spec("pandas") is None, "pandas is not installed")
+    def test_parse_folder_can_throttle_progress_logs(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            folder = Path(tmpdir)
+            for index in range(4):
+                (folder / f"{index}.txt").write_text("\t Вид\tA\nPM1\tone\n")
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = parse_folder(folder, progress_every=3)
+
+        self.assertEqual(result.files_ok, 4)
+        log_text = output.getvalue()
+        self.assertIn("[1/4] parsing", log_text)
+        self.assertNotIn("[2/4] parsing", log_text)
+        self.assertIn("[3/4] parsing", log_text)
+        self.assertIn("[4/4] parsing", log_text)
+
+    def test_parse_folder_fast_streams_one_output_per_file(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            folder = Path(tmpdir) / "input"
+            output = Path(tmpdir) / "output"
+            folder.mkdir()
+            (folder / "a.txt").write_text(
+                "\n".join(
+                    [
+                        "ignore",
+                        "\t Вид\tA",
+                        "PM1\tone",
+                        "wrapped",
+                        "",
+                        "",
+                        "\t Вид\tB",
+                        "PM2\ttwo",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (folder / "b.txt").write_text("\t Вид\tA\nPM3\tthree\n", encoding="utf-8")
+
+            result = parse_folder_fast(folder, output_dir=output, workers=1, log=False)
+
+            self.assertEqual(result.files_total, 2)
+            self.assertEqual(result.files_ok, 2)
+            self.assertEqual(result.files_failed, 0)
+            self.assertEqual(result.rows_written, 3)
+            self.assertEqual(len(result.results), 2)
+            self.assertTrue(Path(result.summary_path).exists())
+
+            first_result = result.results[0]
+            with Path(first_result.output_rows_path).open(encoding="utf-8", newline="") as f:
+                rows = list(csv.reader(f, delimiter="\t"))
+            self.assertEqual(rows[0][:5], ["1", "1", "3,4", "1", "PM1"])
+            self.assertEqual(rows[0][5], "onewrapped")
+            self.assertEqual(rows[1][:6], ["1", "2", "8", "2", "PM2", "two"])
+
+            headers_payload = json.loads(
+                Path(first_result.output_headers_path).read_text(encoding="utf-8")
+            )
+            self.assertEqual(headers_payload["max_cells"], 2)
+            self.assertEqual(len(headers_payload["headers"]), 2)
+            self.assertEqual(headers_payload["headers"][0]["columns"], ["Вид", "A"])
+            self.assertEqual(headers_payload["headers"][1]["columns"], ["Вид", "B"])
 
 
 if __name__ == "__main__":

@@ -3,11 +3,15 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import csv
 import json
+import os
 import re
 import time
 import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +93,51 @@ class FolderParseResult:
     tables_total: int
 
 
+@dataclass
+class FastFileParseResult:
+    file_number: int
+    source_file: str
+    source_path: str
+    output_rows_path: str
+    output_headers_path: str
+    encoding: str
+    bytes_read: int
+    physical_rows: int
+    rows_written: int
+    headers_found: int
+    header_variants: int
+    skipped_leading_rows: int
+    blank_rows_removed: int
+    continuation_rows_joined: int
+    orphan_continuation_rows: int
+    rows_with_short_right_side: int
+    rows_with_extra_columns: int
+    rows_with_delimiter_issues: int
+    rows_with_issues: int
+    elapsed_sec: float
+    issue_samples: list[dict[str, Any]]
+
+
+@dataclass
+class FastFolderParseResult:
+    output_dir: str
+    files_total: int
+    files_ok: int
+    files_failed: int
+    rows_written: int
+    elapsed_sec: float
+    results: list[FastFileParseResult]
+    errors: list[dict[str, Any]]
+    summary_path: str
+
+
+@dataclass
+class SeparatorLayout:
+    separator_widths: tuple[int, ...]
+    resolved_counts: tuple[dict[int, int], ...]
+    min_widths: tuple[int, ...]
+
+
 def read_text_file(path: str | Path, encoding: str | None = None) -> str:
     path = Path(path)
     if encoding is not None:
@@ -141,16 +190,31 @@ def split_physical_rows(text: str) -> list[PhysicalRow]:
     ]
 
 
+def is_header_raw(raw: str) -> bool:
+    return raw.lstrip("\ufeff\u200b\u200c\u200d").startswith(HEADER_PREFIX)
+
+
 def is_header_row(row: PhysicalRow) -> bool:
-    return row.raw.lstrip("\ufeff\u200b\u200c\u200d").startswith(HEADER_PREFIX)
+    return is_header_raw(row.raw)
+
+
+def row_content_start(raw: str, drop_leading_tab: bool = False) -> int:
+    start = 1 if drop_leading_tab and raw.startswith("\t") else 0
+    raw_length = len(raw)
+
+    while start < raw_length and raw[start] in ROW_START_IGNORED_CHARS:
+        start += 1
+
+    return start
 
 
 def first_cell_for_classification(raw: str, drop_leading_tab: bool = False) -> str:
-    if drop_leading_tab and raw.startswith("\t"):
-        raw = raw[1:]
+    start = row_content_start(raw, drop_leading_tab=drop_leading_tab)
+    end = raw.find("\t", start)
+    if end == -1:
+        end = len(raw)
 
-    text = raw.lstrip(ROW_START_IGNORED_CHARS)
-    return text.split("\t", 1)[0].strip(ROW_START_IGNORED_CHARS)
+    return raw[start:end].strip(ROW_START_IGNORED_CHARS)
 
 
 def is_data_row(
@@ -158,25 +222,36 @@ def is_data_row(
     allow_anonymized_prefix: bool = False,
     drop_leading_tab: bool = False,
 ) -> bool:
-    first_cell = first_cell_for_classification(raw, drop_leading_tab=drop_leading_tab)
+    if raw[: len(DATA_ROW_PREFIX)].upper() == DATA_ROW_PREFIX:
+        return True
 
-    if first_cell.upper().startswith(DATA_ROW_PREFIX):
+    start = row_content_start(raw, drop_leading_tab=drop_leading_tab)
+
+    if raw[start : start + len(DATA_ROW_PREFIX)].upper() == DATA_ROW_PREFIX:
         return True
 
     if not allow_anonymized_prefix:
         return False
 
-    return (
-        first_cell.startswith(ANONYMIZED_DATA_ROW_PREFIX)
-        and any(ch.isdigit() for ch in first_cell)
+    if not raw.startswith(ANONYMIZED_DATA_ROW_PREFIX, start):
+        return False
+
+    end = raw.find("\t", start)
+    if end == -1:
+        end = len(raw)
+
+    return "1" in raw[start:end]
+
+
+def is_fallback_header_raw(raw: str) -> bool:
+    return raw.count("\t") >= MIN_HEADER_TABS and not is_data_row(
+        raw,
+        allow_anonymized_prefix=True,
     )
 
 
 def is_fallback_header_row(row: PhysicalRow) -> bool:
-    return row.raw.count("\t") >= MIN_HEADER_TABS and not is_data_row(
-        row.raw,
-        allow_anonymized_prefix=True,
-    )
+    return is_fallback_header_raw(row.raw)
 
 
 def header_parse_text(raw: str) -> str:
@@ -241,90 +316,86 @@ def separator_width_options(index: int, expected_width: int) -> tuple[int, ...]:
     return (expected_width,)
 
 
-def resolve_separator_count(
-    separator_widths: list[int],
-    start_index: int,
-    run_width: int,
-) -> int | None:
-    sums = {0}
-    for end_index in range(start_index, len(separator_widths)):
-        sums = {
-            total + option
-            for total in sums
-            for option in separator_width_options(end_index, separator_widths[end_index])
-        }
-        if run_width in sums:
-            return end_index - start_index + 1
-        sums = {total for total in sums if total <= run_width}
-        if not sums:
-            return None
-    return None
+def build_separator_layout(separator_widths: list[int]) -> SeparatorLayout:
+    return build_separator_layout_cached(tuple(separator_widths))
 
 
-def fallback_separator_count(
-    separator_widths: list[int],
-    start_index: int,
-    run_width: int,
-) -> int:
-    if start_index >= len(separator_widths):
-        return 1
+@lru_cache(maxsize=128)
+def build_separator_layout_cached(widths: tuple[int, ...]) -> SeparatorLayout:
+    resolved_counts: list[dict[int, int]] = []
+    min_widths = tuple(
+        min(separator_width_options(index, expected_width))
+        for index, expected_width in enumerate(widths)
+    )
 
-    total = 0
-    consumed = 0
-    for index in range(start_index, len(separator_widths)):
-        total += min(separator_width_options(index, separator_widths[index]))
-        consumed += 1
-        if total >= run_width:
-            return consumed
-    return max(consumed, 1)
+    for start_index in range(len(widths)):
+        counts_by_run_width: dict[int, int] = {}
+        sums = {0}
+        for end_index in range(start_index, len(widths)):
+            sums = {
+                total + option
+                for total in sums
+                for option in separator_width_options(end_index, widths[end_index])
+            }
+            separator_count = end_index - start_index + 1
+            for run_width in sums:
+                counts_by_run_width.setdefault(run_width, separator_count)
+        resolved_counts.append(counts_by_run_width)
 
-
-def tokenize_tab_runs(raw: str) -> tuple[list[str], list[int]]:
-    values: list[str] = []
-    run_widths: list[int] = []
-    previous_end = 0
-
-    for match in TAB_RUN_RE.finditer(raw):
-        values.append(raw[previous_end : match.start()])
-        run_widths.append(len(match.group(0)))
-        previous_end = match.end()
-
-    values.append(raw[previous_end:])
-    return values, run_widths
+    return SeparatorLayout(
+        separator_widths=widths,
+        resolved_counts=tuple(resolved_counts),
+        min_widths=min_widths,
+    )
 
 
 def parse_cells(
     raw: str,
     header_width: int,
-    separator_widths: list[int],
+    layout: SeparatorLayout,
     drop_leading_tab: bool = False,
 ) -> tuple[list[str], list[str], bool, bool]:
-    if drop_leading_tab and raw.startswith("\t"):
-        raw = raw[1:]
-
-    values, run_widths = tokenize_tab_runs(raw)
-    cells = [values[0]]
+    start = 1 if drop_leading_tab and raw.startswith("\t") else 0
+    raw_length = len(raw)
+    cells: list[str] = []
     separator_index = 0
     issues: list[str] = []
     used_special_separator_width = False
+    separator_widths = layout.separator_widths
+    resolved_counts = layout.resolved_counts
+    min_widths = layout.min_widths
+    separator_widths_count = len(separator_widths)
+    find_tab = raw.find
 
-    for run_width, next_value in zip(run_widths, values[1:]):
-        if separator_index >= len(separator_widths):
-            cells.append(next_value)
+    position = start
+    while True:
+        tab_start = find_tab("\t", position)
+        if tab_start == -1:
+            cells.append(raw[position:])
+            break
+
+        cells.append(raw[position:tab_start])
+        tab_end = tab_start + 1
+        while tab_end < raw_length and raw[tab_end] == "\t":
+            tab_end += 1
+        run_width = tab_end - tab_start
+
+        if separator_index >= separator_widths_count:
             issues.append(f"extra delimiter run of {run_width} tabs after header columns")
+            position = tab_end
             continue
 
-        separator_count = resolve_separator_count(
-            separator_widths,
-            separator_index,
-            run_width,
-        )
+        separator_count = resolved_counts[separator_index].get(run_width)
         if separator_count is None:
-            separator_count = fallback_separator_count(
-                separator_widths,
-                separator_index,
-                run_width,
-            )
+            total_width = 0
+            separator_count = 0
+            for index in range(separator_index, separator_widths_count):
+                total_width += min_widths[index]
+                separator_count += 1
+                if total_width >= run_width:
+                    break
+            if separator_count == 0:
+                separator_count = 1
             issues.append(
                 f"delimiter run of {run_width} tabs does not match header layout "
                 f"at separator {separator_index + 1}"
@@ -338,9 +409,10 @@ def parse_cells(
         ):
             used_special_separator_width = True
 
-        cells.extend([""] * (separator_count - 1))
-        cells.append(next_value)
+        if separator_count > 1:
+            cells.extend([""] * (separator_count - 1))
         separator_index += separator_count
+        position = tab_end
 
     short_right_side = len(cells) < header_width
     if short_right_side:
@@ -400,6 +472,7 @@ def parse_document(text: str) -> ParseResult:
 
     for header_row, body_rows in split_tables(rows, debug):
         header, separator_widths = parse_header(header_row.raw)
+        separator_layout = build_separator_layout(separator_widths)
         drop_leading_tab = header_row.raw.startswith("\t")
         allow_anonymized_prefix = not is_header_row(header_row)
         table_debug = TableDebug(physical_rows=1 + len(body_rows))
@@ -415,7 +488,7 @@ def parse_document(text: str) -> ParseResult:
             cells, cell_issues, short_right_side, used_special_separator_width = parse_cells(
                 raw,
                 len(header),
-                separator_widths,
+                separator_layout,
                 drop_leading_tab=drop_leading_tab,
             )
             issues = row_issues + cell_issues
@@ -480,15 +553,15 @@ def parsed_result_to_dataframes(
         meta_columns.extend(["table_number", "row_number", "physical_row_numbers"])
         columns = meta_columns + table.header
         records = []
+        header_len = len(table.header)
+        base_values = meta_values + [table_number]
+        records_append = records.append
 
         for row_number, row in enumerate(table.rows, start=1):
-            records.append(
-                meta_values
-                + [table_number, row_number, row.line_numbers]
-                + row.cells[: len(table.header)]
-            )
+            cells = row.cells if len(row.cells) == header_len else row.cells[:header_len]
+            records_append(base_values + [row_number, row.line_numbers] + cells)
 
-        dataframes.append(pd.DataFrame(records, columns=columns))
+        dataframes.append(pd.DataFrame(records, columns=columns, dtype=object))
 
     return dataframes
 
@@ -561,10 +634,13 @@ def parse_folder(
     recursive: bool = False,
     stop_on_error: bool = False,
     log: bool = True,
+    progress_every: int = 1,
 ) -> FolderParseResult:
     folder = Path(folder_path)
     if not folder.is_dir():
         raise NotADirectoryError(f"Folder does not exist or is not a directory: {folder}")
+    if progress_every < 1:
+        raise ValueError("progress_every must be 1 or greater")
 
     files = iter_txt_files(folder, recursive=recursive)
     dataframes = []
@@ -578,7 +654,14 @@ def parse_folder(
         print(f"[start] folder={folder} txt_files={len(files)} mode={mode}", flush=True)
 
     for file_number, path in enumerate(files, start=1):
-        if log:
+        show_progress = log and (
+            progress_every == 1
+            or file_number == 1
+            or file_number == len(files)
+            or file_number % progress_every == 0
+        )
+
+        if show_progress:
             print(f"[{file_number}/{len(files)}] parsing {path}", flush=True)
 
         try:
@@ -619,7 +702,7 @@ def parse_folder(
                 )
             warnings.extend(file_warnings)
 
-            if log:
+            if show_progress or (log and file_warnings):
                 rows_total = sum(len(table.rows) for table in result.tables)
                 warning_text = f" warnings={len(file_warnings)}" if file_warnings else ""
                 print(
@@ -682,6 +765,513 @@ def parse_folder(
     return result
 
 
+def detect_text_encoding(
+    path: str | Path,
+    encoding: str | None = None,
+    sample_bytes: int = 1024 * 1024,
+) -> str:
+    if encoding is not None:
+        return encoding
+
+    path = Path(path)
+    with path.open("rb") as sample_file:
+        sample = sample_file.read(sample_bytes)
+    if not sample:
+        return DEFAULT_TEXT_ENCODINGS[0]
+
+    last_error: UnicodeDecodeError | None = None
+    for candidate_encoding in DEFAULT_TEXT_ENCODINGS:
+        try:
+            sample.decode(candidate_encoding)
+            return candidate_encoding
+        except UnicodeDecodeError as exc:
+            last_error = exc
+
+    assert last_error is not None
+    last_error.add_note(f"Tried encodings: {', '.join(DEFAULT_TEXT_ENCODINGS)}")
+    raise last_error
+
+
+def safe_output_stem(path: Path, file_number: int) -> str:
+    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", path.stem).strip("._")
+    if not safe_stem:
+        safe_stem = "table"
+    return f"{file_number:04d}_{safe_stem[:80]}"
+
+
+def fast_result_to_dict(result: FastFileParseResult) -> dict[str, Any]:
+    return {
+        "file_number": result.file_number,
+        "source_file": result.source_file,
+        "source_path": result.source_path,
+        "output_rows_path": result.output_rows_path,
+        "output_headers_path": result.output_headers_path,
+        "encoding": result.encoding,
+        "bytes_read": result.bytes_read,
+        "physical_rows": result.physical_rows,
+        "rows_written": result.rows_written,
+        "headers_found": result.headers_found,
+        "header_variants": result.header_variants,
+        "skipped_leading_rows": result.skipped_leading_rows,
+        "blank_rows_removed": result.blank_rows_removed,
+        "continuation_rows_joined": result.continuation_rows_joined,
+        "orphan_continuation_rows": result.orphan_continuation_rows,
+        "rows_with_short_right_side": result.rows_with_short_right_side,
+        "rows_with_extra_columns": result.rows_with_extra_columns,
+        "rows_with_delimiter_issues": result.rows_with_delimiter_issues,
+        "rows_with_issues": result.rows_with_issues,
+        "elapsed_sec": result.elapsed_sec,
+        "issue_samples": result.issue_samples,
+    }
+
+
+def parse_file_fast(
+    path: str | Path,
+    output_dir: str | Path,
+    file_number: int = 1,
+    files_total: int = 1,
+    encoding: str | None = None,
+    sample_bytes: int = 1024 * 1024,
+    progress_mb: int = 256,
+    log: bool = True,
+) -> FastFileParseResult:
+    """Stream one large txt file to one TSV row file plus a header map JSON.
+
+    This path is for production-scale files. It does not build pandas objects
+    and it does not read the whole input into memory.
+    """
+    path = Path(path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    selected_encoding = detect_text_encoding(
+        path,
+        encoding=encoding,
+        sample_bytes=sample_bytes,
+    )
+    output_stem = safe_output_stem(path, file_number)
+    output_rows_path = output_dir / f"{output_stem}.rows.tsv"
+    output_headers_path = output_dir / f"{output_stem}.headers.json"
+
+    started_at = time.monotonic()
+    file_size = path.stat().st_size
+    progress_step = max(progress_mb, 1) * 1024 * 1024
+    next_progress_at = progress_step
+
+    bytes_read = 0
+    physical_rows = 0
+    rows_written = 0
+    headers_found = 0
+    skipped_leading_rows = 0
+    blank_rows_removed = 0
+    continuation_rows_joined = 0
+    orphan_continuation_rows = 0
+    rows_with_short_right_side = 0
+    rows_with_extra_columns = 0
+    rows_with_delimiter_issues = 0
+    rows_with_issues = 0
+    max_cells = 0
+    blank_run = 0
+    issue_samples: list[dict[str, Any]] = []
+
+    header_by_key: dict[tuple[tuple[str, ...], tuple[int, ...]], int] = {}
+    header_records: list[dict[str, Any]] = []
+    current_header: list[str] | None = None
+    current_layout: SeparatorLayout | None = None
+    current_header_id = 0
+    drop_leading_tab = False
+    allow_anonymized_prefix = False
+
+    pending_line_numbers: list[int] | None = None
+    pending_parts: list[str] | None = None
+    pending_issues: list[str] = []
+
+    if log:
+        print(
+            f"[file {file_number}/{files_total}] start {path} "
+            f"size_mb={file_size / 1024 / 1024:.1f} encoding={selected_encoding}",
+            flush=True,
+        )
+
+    def set_header(raw: str, line_number: int) -> None:
+        nonlocal current_header
+        nonlocal current_layout
+        nonlocal current_header_id
+        nonlocal drop_leading_tab
+        nonlocal allow_anonymized_prefix
+        nonlocal headers_found
+
+        header, separator_widths = parse_header(raw)
+        key = (tuple(header), tuple(separator_widths))
+        header_id = header_by_key.get(key)
+        if header_id is None:
+            header_id = len(header_records) + 1
+            header_by_key[key] = header_id
+            header_records.append(
+                {
+                    "header_number": header_id,
+                    "first_line_number": line_number,
+                    "columns": header,
+                    "separator_widths": separator_widths,
+                    "occurrences": 1,
+                }
+            )
+        else:
+            header_records[header_id - 1]["occurrences"] += 1
+
+        current_header = header
+        current_layout = build_separator_layout(separator_widths)
+        current_header_id = header_id
+        drop_leading_tab = raw.startswith("\t")
+        allow_anonymized_prefix = not is_header_raw(raw)
+        headers_found += 1
+
+    with path.open("rb") as input_file, output_rows_path.open(
+        "w",
+        encoding="utf-8",
+        newline="",
+    ) as output_file:
+        writer = csv.writer(output_file, delimiter="\t", lineterminator="\n")
+
+        def finalize_pending_row() -> None:
+            nonlocal pending_line_numbers
+            nonlocal pending_parts
+            nonlocal pending_issues
+            nonlocal rows_written
+            nonlocal rows_with_short_right_side
+            nonlocal rows_with_extra_columns
+            nonlocal rows_with_delimiter_issues
+            nonlocal rows_with_issues
+            nonlocal max_cells
+
+            if pending_line_numbers is None or pending_parts is None:
+                return
+
+            if current_header is None or current_layout is None:
+                pending_line_numbers = None
+                pending_parts = None
+                pending_issues = []
+                return
+
+            raw = "".join(pending_parts)
+            cells, cell_issues, short_right_side, _ = parse_cells(
+                raw,
+                len(current_header),
+                current_layout,
+                drop_leading_tab=drop_leading_tab,
+            )
+            issues = pending_issues + cell_issues
+
+            rows_written += 1
+            max_cells = max(max_cells, len(cells))
+            if short_right_side:
+                rows_with_short_right_side += 1
+            if len(cells) > len(current_header):
+                rows_with_extra_columns += 1
+            if cell_issues:
+                rows_with_delimiter_issues += 1
+            if issues:
+                rows_with_issues += 1
+                if len(issue_samples) < 20:
+                    issue_samples.append(
+                        {
+                            "row_number": rows_written,
+                            "line_numbers": pending_line_numbers.copy(),
+                            "issues": issues,
+                        }
+                    )
+
+            writer.writerow(
+                [
+                    1,
+                    rows_written,
+                    ",".join(str(number) for number in pending_line_numbers),
+                    current_header_id,
+                    *cells,
+                ]
+            )
+
+            pending_line_numbers = None
+            pending_parts = None
+            pending_issues = []
+
+        for line_bytes in input_file:
+            bytes_read += len(line_bytes)
+            physical_rows += 1
+            raw = line_bytes.decode(selected_encoding).rstrip("\r\n")
+
+            if log and bytes_read >= next_progress_at:
+                elapsed = max(time.monotonic() - started_at, 0.001)
+                percent = (bytes_read / file_size * 100) if file_size else 100.0
+                print(
+                    f"[file {file_number}/{files_total}] {path.name} "
+                    f"{bytes_read / 1024 / 1024:.0f}/{file_size / 1024 / 1024:.0f} MB "
+                    f"({percent:.1f}%) rows={rows_written} "
+                    f"headers={headers_found} speed_mb_s={bytes_read / 1024 / 1024 / elapsed:.1f}",
+                    flush=True,
+                )
+                while next_progress_at <= bytes_read:
+                    next_progress_at += progress_step
+
+            if not raw or raw.isspace():
+                blank_run += 1
+                if current_header is None:
+                    skipped_leading_rows += 1
+                else:
+                    blank_rows_removed += 1
+                continue
+
+            starts_header_by_marker = is_header_raw(raw)
+            starts_first_header_by_shape = (
+                current_header is None and is_fallback_header_raw(raw)
+            )
+            starts_next_header_by_shape = (
+                current_header is not None
+                and blank_run >= TABLE_GAP
+                and is_fallback_header_raw(raw)
+            )
+
+            if (
+                starts_header_by_marker
+                or starts_first_header_by_shape
+                or starts_next_header_by_shape
+            ):
+                finalize_pending_row()
+                set_header(raw, physical_rows)
+                blank_run = 0
+                continue
+
+            if current_header is None:
+                skipped_leading_rows += 1
+                blank_run = 0
+                continue
+
+            if is_data_row(
+                raw,
+                allow_anonymized_prefix=allow_anonymized_prefix,
+                drop_leading_tab=drop_leading_tab,
+            ):
+                finalize_pending_row()
+                pending_line_numbers = [physical_rows]
+                pending_parts = [raw]
+                pending_issues = []
+            elif pending_line_numbers is None or pending_parts is None:
+                orphan_continuation_rows += 1
+                pending_line_numbers = [physical_rows]
+                pending_parts = [raw]
+                pending_issues = ["non-PM row has no previous data row to join"]
+            else:
+                continuation_rows_joined += 1
+                pending_line_numbers.append(physical_rows)
+                pending_parts.append(raw)
+
+            blank_run = 0
+
+        finalize_pending_row()
+
+    elapsed_sec = time.monotonic() - started_at
+    result = FastFileParseResult(
+        file_number=file_number,
+        source_file=path.name,
+        source_path=str(path),
+        output_rows_path=str(output_rows_path),
+        output_headers_path=str(output_headers_path),
+        encoding=selected_encoding,
+        bytes_read=bytes_read,
+        physical_rows=physical_rows,
+        rows_written=rows_written,
+        headers_found=headers_found,
+        header_variants=len(header_records),
+        skipped_leading_rows=skipped_leading_rows,
+        blank_rows_removed=blank_rows_removed,
+        continuation_rows_joined=continuation_rows_joined,
+        orphan_continuation_rows=orphan_continuation_rows,
+        rows_with_short_right_side=rows_with_short_right_side,
+        rows_with_extra_columns=rows_with_extra_columns,
+        rows_with_delimiter_issues=rows_with_delimiter_issues,
+        rows_with_issues=rows_with_issues,
+        elapsed_sec=elapsed_sec,
+        issue_samples=issue_samples,
+    )
+
+    headers_payload = {
+        "source_file": path.name,
+        "source_path": str(path),
+        "rows_path": str(output_rows_path),
+        "rows_tsv_layout": [
+            "table_number",
+            "row_number",
+            "physical_row_numbers",
+            "header_number",
+            "cell_1",
+            "...",
+        ],
+        "max_cells": max_cells,
+        "headers": header_records,
+        "summary": fast_result_to_dict(result),
+    }
+    output_headers_path.write_text(
+        json.dumps(headers_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    if log:
+        print(
+            f"[file {file_number}/{files_total}] done {path.name} "
+            f"rows={rows_written} headers={headers_found} "
+            f"header_variants={len(header_records)} "
+            f"issue_rows={rows_with_issues} elapsed_sec={elapsed_sec:.1f}",
+            flush=True,
+        )
+
+    return result
+
+
+def parse_folder_fast(
+    folder_path: str | Path,
+    output_dir: str | Path | None = None,
+    encoding: str | None = None,
+    recursive: bool = False,
+    workers: int | None = None,
+    progress_mb: int = 256,
+    sample_bytes: int = 1024 * 1024,
+    log: bool = True,
+    stop_on_error: bool = False,
+) -> FastFolderParseResult:
+    """Parse all txt files in a folder with one output table per input file."""
+    folder = Path(folder_path)
+    if not folder.is_dir():
+        raise NotADirectoryError(f"Folder does not exist or is not a directory: {folder}")
+
+    files = iter_txt_files(folder, recursive=recursive)
+    if output_dir is None:
+        output_dir = folder / "parsed_tables_fast"
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    if workers is None:
+        workers = min(len(files), os.cpu_count() or 1, 4) if files else 1
+    workers = max(workers, 1)
+
+    started_at = time.monotonic()
+    if log:
+        mode = "recursive" if recursive else "non-recursive"
+        print(
+            f"[fast-start] folder={folder} txt_files={len(files)} "
+            f"workers={workers} mode={mode} output_dir={output_path}",
+            flush=True,
+        )
+
+    results: list[FastFileParseResult] = []
+    errors: list[dict[str, Any]] = []
+
+    jobs = [
+        {
+            "path": str(path),
+            "output_dir": str(output_path),
+            "file_number": file_number,
+            "files_total": len(files),
+            "encoding": encoding,
+            "sample_bytes": sample_bytes,
+            "progress_mb": progress_mb,
+            "log": log,
+        }
+        for file_number, path in enumerate(files, start=1)
+    ]
+
+    if workers == 1:
+        for job in jobs:
+            try:
+                results.append(parse_file_fast(**job))
+            except Exception as exc:
+                error = {
+                    "file_number": job["file_number"],
+                    "source_path": job["path"],
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+                errors.append(error)
+                if log:
+                    print(
+                        f"[fast-error] file={job['path']} "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    print(error["traceback"], flush=True)
+                if stop_on_error:
+                    raise
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            future_to_job = {
+                executor.submit(parse_file_fast, **job): job
+                for job in jobs
+            }
+            for future in as_completed(future_to_job):
+                job = future_to_job[future]
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    error = {
+                        "file_number": job["file_number"],
+                        "source_path": job["path"],
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "traceback": traceback.format_exc(),
+                    }
+                    errors.append(error)
+                    if log:
+                        print(
+                            f"[fast-error] file={job['path']} "
+                            f"{type(exc).__name__}: {exc}",
+                            flush=True,
+                        )
+                        print(error["traceback"], flush=True)
+                    if stop_on_error:
+                        raise
+
+    results.sort(key=lambda result: result.file_number)
+    errors.sort(key=lambda error: error["file_number"])
+    elapsed_sec = time.monotonic() - started_at
+    summary_path = output_path / "parse_summary.json"
+    folder_result = FastFolderParseResult(
+        output_dir=str(output_path),
+        files_total=len(files),
+        files_ok=len(results),
+        files_failed=len(errors),
+        rows_written=sum(result.rows_written for result in results),
+        elapsed_sec=elapsed_sec,
+        results=results,
+        errors=errors,
+        summary_path=str(summary_path),
+    )
+
+    summary_payload = {
+        "output_dir": str(output_path),
+        "files_total": folder_result.files_total,
+        "files_ok": folder_result.files_ok,
+        "files_failed": folder_result.files_failed,
+        "rows_written": folder_result.rows_written,
+        "elapsed_sec": folder_result.elapsed_sec,
+        "results": [fast_result_to_dict(result) for result in results],
+        "errors": errors,
+    }
+    summary_path.write_text(
+        json.dumps(summary_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    if log:
+        print(
+            f"[fast-done] files_ok={folder_result.files_ok}/{folder_result.files_total} "
+            f"files_failed={folder_result.files_failed} rows={folder_result.rows_written} "
+            f"elapsed_sec={elapsed_sec:.1f} summary={summary_path}",
+            flush=True,
+        )
+
+    return folder_result
+
+
 def summarize_result(result: ParseResult) -> dict[str, object]:
     return {
         "debug": {
@@ -740,7 +1330,46 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("path", type=Path)
     parser.add_argument("--encoding")
+    parser.add_argument(
+        "--fast-folder",
+        action="store_true",
+        help="stream all txt files in a folder and write one output table per file",
+    )
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--recursive", action="store_true")
+    parser.add_argument("--workers", type=int)
+    parser.add_argument("--progress-mb", type=int, default=256)
+    parser.add_argument("--sample-bytes", type=int, default=1024 * 1024)
+    parser.add_argument("--stop-on-error", action="store_true")
     args = parser.parse_args()
+
+    if args.fast_folder:
+        result = parse_folder_fast(
+            args.path,
+            output_dir=args.output_dir,
+            encoding=args.encoding,
+            recursive=args.recursive,
+            workers=args.workers,
+            progress_mb=args.progress_mb,
+            sample_bytes=args.sample_bytes,
+            stop_on_error=args.stop_on_error,
+        )
+        print(
+            json.dumps(
+                {
+                    "output_dir": result.output_dir,
+                    "files_total": result.files_total,
+                    "files_ok": result.files_ok,
+                    "files_failed": result.files_failed,
+                    "rows_written": result.rows_written,
+                    "elapsed_sec": result.elapsed_sec,
+                    "summary_path": result.summary_path,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
 
     result = parse_document(read_table_text(args.path, encoding=args.encoding))
     print(json.dumps(summarize_result(result), ensure_ascii=False, indent=2))

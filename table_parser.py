@@ -15,6 +15,7 @@ SPECIAL_SEPARATOR_INDEX = 2
 TABLE_GAP = 4
 MIN_HEADER_TABS = 2
 TAB_RUN_RE = re.compile(r"\t+")
+DEFAULT_TEXT_ENCODINGS = ("utf-8-sig", "cp1251", "cp1252")
 
 
 @dataclass
@@ -72,8 +73,25 @@ class ParseResult:
     debug: ParseDebug
 
 
-def read_table_text(path: Path) -> str:
-    text = path.read_text()
+def read_text_file(path: str | Path, encoding: str | None = None) -> str:
+    path = Path(path)
+    if encoding is not None:
+        return path.read_text(encoding=encoding)
+
+    last_error: UnicodeDecodeError | None = None
+    for candidate_encoding in DEFAULT_TEXT_ENCODINGS:
+        try:
+            return path.read_text(encoding=candidate_encoding)
+        except UnicodeDecodeError as exc:
+            last_error = exc
+
+    assert last_error is not None
+    last_error.add_note(f"Tried encodings: {', '.join(DEFAULT_TEXT_ENCODINGS)}")
+    raise last_error
+
+
+def read_table_text(path: str | Path, encoding: str | None = None) -> str:
+    text = read_text_file(path, encoding=encoding)
     if "\n" not in text and ("\\n" in text or "\\t" in text):
         text = text.replace("\\n", "\n").replace("\\t", "\t")
     return text
@@ -374,10 +392,10 @@ def parse_tables(text: str) -> list[ParsedTable]:
     return parse_document(text).tables
 
 
-def parse_tables_to_dataframes(path: str | Path) -> list[Any]:
+def parse_tables_to_dataframes(path: str | Path, encoding: str | None = None) -> list[Any]:
     import pandas as pd
 
-    result = parse_document(read_table_text(Path(path)))
+    result = parse_document(read_table_text(path, encoding=encoding))
     dataframes = []
 
     for table_number, table in enumerate(result.tables, start=1):
@@ -395,8 +413,8 @@ def parse_tables_to_dataframes(path: str | Path) -> list[Any]:
     return dataframes
 
 
-def parse_file(path: str | Path) -> list[Any]:
-    return parse_tables_to_dataframes(path)
+def parse_file(path: str | Path, encoding: str | None = None) -> list[Any]:
+    return parse_tables_to_dataframes(path, encoding=encoding)
 
 
 def summarize_result(result: ParseResult) -> dict[str, object]:
@@ -456,9 +474,10 @@ def summarize_tables(tables: list[ParsedTable]) -> dict[str, object]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("path", type=Path)
+    parser.add_argument("--encoding")
     args = parser.parse_args()
 
-    result = parse_document(read_table_text(args.path))
+    result = parse_document(read_table_text(args.path, encoding=args.encoding))
     print(json.dumps(summarize_result(result), ensure_ascii=False, indent=2))
 
 

@@ -5,7 +5,13 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from anonymize_text import anonymize_file, anonymize_text, normalize_and_encode, normalize_text
+from anonymize_text import (
+    anonymize_file,
+    anonymize_text,
+    normalize_and_encode,
+    normalize_text,
+    read_text_file,
+)
 
 
 class AnonymizeTextTests(unittest.TestCase):
@@ -39,6 +45,16 @@ class AnonymizeTextTests(unittest.TestCase):
 
             self.assertEqual(output_path.read_text(), encoded)
             self.assertEqual(base64.b64decode(encoded).decode("utf-8"), "AAAA 11")
+
+    def test_file_read_handles_windows_cyrillic_encoding(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "input.txt"
+            input_path.write_bytes("Привет\t42\n".encode("cp1251"))
+
+            encoded = anonymize_file(input_path, print_normalized=False)
+
+            self.assertEqual(read_text_file(input_path), "Привет\t42\n")
+            self.assertEqual(base64.b64decode(encoded).decode("utf-8"), "AAAAAA\t11\n")
 
 
 if __name__ == "__main__":

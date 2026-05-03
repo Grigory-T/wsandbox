@@ -62,6 +62,16 @@ class TableParserTests(unittest.TestCase):
         self.assertEqual(len(result.tables[0].rows), 60)
         self.assertEqual(len(result.tables[1].rows), 6)
 
+    def test_read_table_text_handles_utf8_bom_and_cp1251_files(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            utf8_path = Path(tmpdir) / "utf8.txt"
+            cp1251_path = Path(tmpdir) / "cp1251.txt"
+            utf8_path.write_bytes("\ufeff\t Вид\tA\nРМ1\tone\n".encode("utf-8"))
+            cp1251_path.write_bytes("\t Вид\tИмя\nРМ1\tОдин\n".encode("cp1251"))
+
+            self.assertTrue(read_table_text(utf8_path).startswith("\t Вид"))
+            self.assertIn("Имя", read_table_text(cp1251_path))
+
     def test_drops_structural_leading_tab_when_parsing_data_cells(self) -> None:
         result = parse_document(
             "\n".join(

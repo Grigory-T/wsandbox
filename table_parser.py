@@ -5,6 +5,8 @@ import base64
 import binascii
 import json
 import re
+import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -74,6 +76,17 @@ class ParseDebug:
 class ParseResult:
     tables: list[ParsedTable]
     debug: ParseDebug
+
+
+@dataclass
+class FolderParseResult:
+    dataframes: list[Any]
+    errors: list[dict[str, Any]]
+    warnings: list[dict[str, Any]]
+    files_total: int
+    files_ok: int
+    files_failed: int
+    tables_total: int
 
 
 def read_text_file(path: str | Path, encoding: str | None = None) -> str:
@@ -442,20 +455,37 @@ def parse_tables(text: str) -> list[ParsedTable]:
     return parse_document(text).tables
 
 
-def parse_tables_to_dataframes(path: str | Path, encoding: str | None = None) -> list[Any]:
+def parsed_result_to_dataframes(
+    result: ParseResult,
+    source_path: str | Path | None = None,
+    file_number: int | None = None,
+) -> list[Any]:
     import pandas as pd
 
-    result = parse_document(read_table_text(path, encoding=encoding))
     dataframes = []
 
     for table_number, table in enumerate(result.tables, start=1):
-        meta_columns = ["table_number", "row_number", "physical_row_numbers"]
+        meta_columns = []
+        meta_values: list[Any] = []
+
+        if file_number is not None:
+            meta_columns.append("file_number")
+            meta_values.append(file_number)
+
+        if source_path is not None:
+            source = Path(source_path)
+            meta_columns.extend(["source_file", "source_path"])
+            meta_values.extend([source.name, str(source)])
+
+        meta_columns.extend(["table_number", "row_number", "physical_row_numbers"])
         columns = meta_columns + table.header
         records = []
 
         for row_number, row in enumerate(table.rows, start=1):
             records.append(
-                [table_number, row_number, row.line_numbers] + row.cells[: len(table.header)]
+                meta_values
+                + [table_number, row_number, row.line_numbers]
+                + row.cells[: len(table.header)]
             )
 
         dataframes.append(pd.DataFrame(records, columns=columns))
@@ -463,8 +493,193 @@ def parse_tables_to_dataframes(path: str | Path, encoding: str | None = None) ->
     return dataframes
 
 
+def parse_tables_to_dataframes(path: str | Path, encoding: str | None = None) -> list[Any]:
+    return parsed_result_to_dataframes(parse_document(read_table_text(path, encoding=encoding)))
+
+
 def parse_file(path: str | Path, encoding: str | None = None) -> list[Any]:
     return parse_tables_to_dataframes(path, encoding=encoding)
+
+
+def iter_txt_files(folder_path: str | Path, recursive: bool = False) -> list[Path]:
+    folder = Path(folder_path)
+    pattern = "**/*.txt" if recursive else "*.txt"
+    return sorted(path for path in folder.glob(pattern) if path.is_file())
+
+
+def table_warning_records(
+    table: ParsedTable,
+    file_number: int,
+    source_path: Path,
+    table_number: int,
+) -> list[dict[str, Any]]:
+    warnings = []
+    row_issues = [
+        {"line_numbers": row.line_numbers, "issues": row.issues}
+        for row in table.rows
+        if row.issues
+    ]
+
+    if row_issues:
+        warnings.append(
+            {
+                "file_number": file_number,
+                "source_file": source_path.name,
+                "source_path": str(source_path),
+                "table_number": table_number,
+                "kind": "row_issues",
+                "details": row_issues,
+            }
+        )
+
+    debug_counts = {
+        "continuation_rows_joined": table.debug.continuation_rows_joined,
+        "orphan_continuation_rows": table.debug.orphan_continuation_rows,
+        "rows_with_extra_columns": table.debug.rows_with_extra_columns,
+        "rows_with_delimiter_issues": table.debug.rows_with_delimiter_issues,
+    }
+    nonzero_debug_counts = {key: value for key, value in debug_counts.items() if value}
+
+    if nonzero_debug_counts:
+        warnings.append(
+            {
+                "file_number": file_number,
+                "source_file": source_path.name,
+                "source_path": str(source_path),
+                "table_number": table_number,
+                "kind": "parse_debug_counts",
+                "details": nonzero_debug_counts,
+            }
+        )
+
+    return warnings
+
+
+def parse_folder(
+    folder_path: str | Path,
+    encoding: str | None = None,
+    recursive: bool = False,
+    stop_on_error: bool = False,
+    log: bool = True,
+) -> FolderParseResult:
+    folder = Path(folder_path)
+    if not folder.is_dir():
+        raise NotADirectoryError(f"Folder does not exist or is not a directory: {folder}")
+
+    files = iter_txt_files(folder, recursive=recursive)
+    dataframes = []
+    errors: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    files_ok = 0
+    started_at = time.monotonic()
+
+    if log:
+        mode = "recursive" if recursive else "non-recursive"
+        print(f"[start] folder={folder} txt_files={len(files)} mode={mode}", flush=True)
+
+    for file_number, path in enumerate(files, start=1):
+        if log:
+            print(f"[{file_number}/{len(files)}] parsing {path}", flush=True)
+
+        try:
+            result = parse_document(read_table_text(path, encoding=encoding))
+            file_dataframes = parsed_result_to_dataframes(
+                result,
+                source_path=path,
+                file_number=file_number,
+            )
+            dataframes.extend(file_dataframes)
+            files_ok += 1
+
+            file_warnings = []
+            if not result.tables:
+                file_warnings.append(
+                    {
+                        "file_number": file_number,
+                        "source_file": path.name,
+                        "source_path": str(path),
+                        "table_number": None,
+                        "kind": "no_tables",
+                        "details": {
+                            "physical_rows": result.debug.physical_rows,
+                            "skipped_leading_rows": result.debug.skipped_leading_rows,
+                            "headers_found": result.debug.headers_found,
+                        },
+                    }
+                )
+
+            for table_number, table in enumerate(result.tables, start=1):
+                file_warnings.extend(
+                    table_warning_records(
+                        table,
+                        file_number=file_number,
+                        source_path=path,
+                        table_number=table_number,
+                    )
+                )
+            warnings.extend(file_warnings)
+
+            if log:
+                rows_total = sum(len(table.rows) for table in result.tables)
+                warning_text = f" warnings={len(file_warnings)}" if file_warnings else ""
+                print(
+                    f"[{file_number}/{len(files)}] ok tables={len(result.tables)} "
+                    f"rows={rows_total}{warning_text}",
+                    flush=True,
+                )
+                for warning in file_warnings:
+                    table_label = (
+                        warning["table_number"]
+                        if warning["table_number"] is not None
+                        else "-"
+                    )
+                    print(
+                        f"[warning] file={path.name} table={table_label} "
+                        f"{warning['kind']}: {warning['details']}",
+                        flush=True,
+                    )
+
+        except Exception as exc:
+            error = {
+                "file_number": file_number,
+                "source_file": path.name,
+                "source_path": str(path),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+            errors.append(error)
+
+            if log:
+                print(
+                    f"[{file_number}/{len(files)}] ERROR {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                print(error["traceback"], flush=True)
+
+            if stop_on_error:
+                raise
+
+    elapsed = time.monotonic() - started_at
+    result = FolderParseResult(
+        dataframes=dataframes,
+        errors=errors,
+        warnings=warnings,
+        files_total=len(files),
+        files_ok=files_ok,
+        files_failed=len(errors),
+        tables_total=len(dataframes),
+    )
+
+    if log:
+        print(
+            f"[done] files_ok={result.files_ok}/{result.files_total} "
+            f"files_failed={result.files_failed} tables={result.tables_total} "
+            f"warnings={len(result.warnings)} elapsed_sec={elapsed:.1f}",
+            flush=True,
+        )
+
+    return result
 
 
 def summarize_result(result: ParseResult) -> dict[str, object]:

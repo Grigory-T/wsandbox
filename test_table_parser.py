@@ -1,9 +1,12 @@
+import io
 import unittest
+from contextlib import redirect_stdout
 from importlib.util import find_spec
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
-from table_parser import parse_document, parse_tables_to_dataframes, read_table_text
+from table_parser import parse_document, parse_folder, parse_tables_to_dataframes, read_table_text
 
 
 class TableParserTests(unittest.TestCase):
@@ -143,6 +146,51 @@ class TableParserTests(unittest.TestCase):
         self.assertEqual(tables[0].loc[0, "physical_row_numbers"], [3, 4])
         self.assertEqual(tables[0].loc[0, "B"], "twowrapped")
         self.assertEqual(tables[1].loc[0, "table_number"], 2)
+
+    @unittest.skipIf(find_spec("pandas") is None, "pandas is not installed")
+    def test_parse_folder_logs_progress_and_captures_file_errors(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            folder = Path(tmpdir)
+            bad_path = folder / "bad.txt"
+            good_path = folder / "good.txt"
+            bad_path.write_text("bad")
+            good_path.write_text("\t Вид\tA\nPM1\tone\n")
+
+            original_read_table_text = read_table_text
+
+            def read_with_failure(path: str | Path, encoding: str | None = None) -> str:
+                if Path(path).name == "bad.txt":
+                    raise ValueError("forced parse failure")
+                return original_read_table_text(path, encoding=encoding)
+
+            output = io.StringIO()
+            with patch("table_parser.read_table_text", side_effect=read_with_failure):
+                with redirect_stdout(output):
+                    result = parse_folder(folder)
+
+        self.assertEqual(result.files_total, 2)
+        self.assertEqual(result.files_ok, 1)
+        self.assertEqual(result.files_failed, 1)
+        self.assertEqual(result.tables_total, 1)
+        self.assertEqual(result.errors[0]["source_file"], "bad.txt")
+        self.assertEqual(result.errors[0]["error_type"], "ValueError")
+        self.assertIn("forced parse failure", result.errors[0]["traceback"])
+        self.assertIn("[start]", output.getvalue())
+        self.assertIn("[1/2] parsing", output.getvalue())
+        self.assertIn("ERROR ValueError", output.getvalue())
+        self.assertIn("[done]", output.getvalue())
+        self.assertEqual(
+            list(result.dataframes[0].columns[:6]),
+            [
+                "file_number",
+                "source_file",
+                "source_path",
+                "table_number",
+                "row_number",
+                "physical_row_numbers",
+            ],
+        )
+        self.assertEqual(result.dataframes[0].loc[0, "source_file"], "good.txt")
 
 
 if __name__ == "__main__":

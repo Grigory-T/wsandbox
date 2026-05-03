@@ -1,1 +1,2 @@
 more-itertools==11.0.2
+pandas>=2.2.0

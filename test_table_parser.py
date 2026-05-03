@@ -14,10 +14,10 @@ class TableParserTests(unittest.TestCase):
                     "before",
                     "\t Вид\tA\tB",
                     "",
-                    "РМ1\tone\ttwo",
+                    "PM1\tone\ttwo",
                     " wrapped",
                     "\t Вид\tC",
-                    "РМ2\tthree",
+                    "PM2\tthree",
                 ]
             )
         )
@@ -31,25 +31,25 @@ class TableParserTests(unittest.TestCase):
         self.assertEqual(first.debug.blank_rows_removed, 1)
         self.assertEqual(first.debug.continuation_rows_joined, 1)
         self.assertEqual(first.rows[0].line_numbers, [4, 5])
-        self.assertEqual(first.rows[0].raw, "РМ1\tone\ttwo wrapped")
+        self.assertEqual(first.rows[0].raw, "PM1\tone\ttwo wrapped")
 
     def test_parses_rows_with_header_tab_layout_and_right_padding(self) -> None:
         result = parse_document(
             "\n".join(
                 [
                     "\t Вид\tA\tB\tC\tD",
-                    "РМ1\tone\t\ttwo\tthree",
-                    "РМ2\tone\ttwo\t\tthree",
-                    "РМ3\tone\ttwo",
+                    "PM1\tone\t\ttwo\tthree",
+                    "PM2\tone\ttwo\t\tthree",
+                    "PM3\tone\ttwo",
                 ]
             )
         )
 
         table = result.tables[0]
         self.assertEqual(table.separator_widths, [1, 1, 1, 1])
-        self.assertEqual(table.rows[0].cells, ["РМ1", "one", "", "two", "three"])
-        self.assertEqual(table.rows[1].cells, ["РМ2", "one", "two", "three", ""])
-        self.assertEqual(table.rows[2].cells, ["РМ3", "one", "two", "", ""])
+        self.assertEqual(table.rows[0].cells, ["PM1", "one", "", "two", "three"])
+        self.assertEqual(table.rows[1].cells, ["PM2", "one", "two", "three", ""])
+        self.assertEqual(table.rows[2].cells, ["PM3", "one", "two", "", ""])
         self.assertEqual(table.debug.rows_using_special_separator_width, 1)
         self.assertEqual(table.debug.rows_with_short_right_side, 2)
 
@@ -66,8 +66,8 @@ class TableParserTests(unittest.TestCase):
         with TemporaryDirectory() as tmpdir:
             utf8_path = Path(tmpdir) / "utf8.txt"
             cp1251_path = Path(tmpdir) / "cp1251.txt"
-            utf8_path.write_bytes("\ufeff\t Вид\tA\nРМ1\tone\n".encode("utf-8"))
-            cp1251_path.write_bytes("\t Вид\tИмя\nРМ1\tОдин\n".encode("cp1251"))
+            utf8_path.write_bytes("\ufeff\t Вид\tA\nPM1\tone\n".encode("utf-8"))
+            cp1251_path.write_bytes("\t Вид\tИмя\nPM1\tОдин\n".encode("cp1251"))
 
             self.assertTrue(read_table_text(utf8_path).startswith("\t Вид"))
             self.assertIn("Имя", read_table_text(cp1251_path))
@@ -90,7 +90,7 @@ class TableParserTests(unittest.TestCase):
             "\n".join(
                 [
                     "\t Вид\tA",
-                    "РМ1\tone",
+                    "PM1\tone",
                     "AA continuation",
                 ]
             )
@@ -99,13 +99,13 @@ class TableParserTests(unittest.TestCase):
         self.assertEqual(len(result.tables[0].rows), 1)
         self.assertEqual(result.tables[0].rows[0].line_numbers, [2, 3])
 
-    def test_real_rm_marker_can_have_structural_prefix_chars(self) -> None:
+    def test_real_pm_marker_can_have_structural_prefix_chars(self) -> None:
         result = parse_document(
             "\n".join(
                 [
                     "\t Вид\tA",
-                    "\t РМ1\tone",
-                    "\t\xa0РМ2\ttwo",
+                    "\t PM1\tone",
+                    "\t\xa0PM2\ttwo",
                 ]
             )
         )
@@ -120,10 +120,10 @@ class TableParserTests(unittest.TestCase):
             [
                 "before",
                 "\t Вид\tA\tB",
-                "РМ1\tone\ttwo",
+                "PM1\tone\ttwo",
                 "wrapped",
                 "\t Вид\tC",
-                "РМ2\tthree",
+                "PM2\tthree",
             ]
         )
 

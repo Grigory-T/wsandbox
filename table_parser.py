@@ -11,7 +11,7 @@ from typing import Any
 
 
 HEADER_PREFIX = "\t Вид"
-DATA_ROW_PREFIX = "РМ"
+DATA_ROW_PREFIX = "PM"
 ANONYMIZED_DATA_ROW_PREFIX = "AA"
 SPECIAL_SEPARATOR_INDEX = 2
 TABLE_GAP = 2
@@ -366,7 +366,7 @@ def join_data_rows(
                 (
                     [row.line_number],
                     row.raw,
-                    ["non-RM row has no previous data row to join"],
+                    ["non-PM row has no previous data row to join"],
                 )
             )
             debug.orphan_continuation_rows += 1

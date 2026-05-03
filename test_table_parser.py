@@ -99,6 +99,21 @@ class TableParserTests(unittest.TestCase):
         self.assertEqual(len(result.tables[0].rows), 1)
         self.assertEqual(result.tables[0].rows[0].line_numbers, [2, 3])
 
+    def test_real_rm_marker_can_have_structural_prefix_chars(self) -> None:
+        result = parse_document(
+            "\n".join(
+                [
+                    "\t Вид\tA",
+                    "\t РМ1\tone",
+                    "\t\xa0РМ2\ttwo",
+                ]
+            )
+        )
+
+        self.assertEqual(len(result.tables[0].rows), 2)
+        self.assertEqual(result.tables[0].rows[0].line_numbers, [2])
+        self.assertEqual(result.tables[0].rows[1].line_numbers, [3])
+
     @unittest.skipIf(find_spec("pandas") is None, "pandas is not installed")
     def test_returns_one_dataframe_per_table(self) -> None:
         text = "\n".join(

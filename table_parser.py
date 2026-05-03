@@ -18,6 +18,7 @@ TABLE_GAP = 2
 MIN_HEADER_TABS = 2
 TAB_RUN_RE = re.compile(r"\t+")
 DEFAULT_TEXT_ENCODINGS = ("utf-8-sig", "cp1251", "cp1252")
+ROW_START_IGNORED_CHARS = "\ufeff\u200b\u200c\u200d\xa0 \t"
 
 
 @dataclass
@@ -128,15 +129,32 @@ def split_physical_rows(text: str) -> list[PhysicalRow]:
 
 
 def is_header_row(row: PhysicalRow) -> bool:
-    return row.raw.startswith(HEADER_PREFIX)
+    return row.raw.lstrip("\ufeff\u200b\u200c\u200d").startswith(HEADER_PREFIX)
 
 
-def is_data_row(raw: str, allow_anonymized_prefix: bool = False) -> bool:
-    text = raw.lstrip("\t ")
-    first_cell = text.split("\t", 1)[0]
-    return text.startswith(DATA_ROW_PREFIX) or (
-        allow_anonymized_prefix
-        and first_cell.startswith(ANONYMIZED_DATA_ROW_PREFIX)
+def first_cell_for_classification(raw: str, drop_leading_tab: bool = False) -> str:
+    if drop_leading_tab and raw.startswith("\t"):
+        raw = raw[1:]
+
+    text = raw.lstrip(ROW_START_IGNORED_CHARS)
+    return text.split("\t", 1)[0].strip(ROW_START_IGNORED_CHARS)
+
+
+def is_data_row(
+    raw: str,
+    allow_anonymized_prefix: bool = False,
+    drop_leading_tab: bool = False,
+) -> bool:
+    first_cell = first_cell_for_classification(raw, drop_leading_tab=drop_leading_tab)
+
+    if first_cell.upper().startswith(DATA_ROW_PREFIX):
+        return True
+
+    if not allow_anonymized_prefix:
+        return False
+
+    return (
+        first_cell.startswith(ANONYMIZED_DATA_ROW_PREFIX)
         and any(ch.isdigit() for ch in first_cell)
     )
 
@@ -325,6 +343,7 @@ def join_data_rows(
     rows: list[PhysicalRow],
     debug: TableDebug,
     allow_anonymized_prefix: bool = False,
+    drop_leading_tab: bool = False,
 ) -> list[tuple[list[int], str, list[str]]]:
     joined_rows: list[tuple[list[int], str, list[str]]] = []
 
@@ -333,7 +352,11 @@ def join_data_rows(
             debug.blank_rows_removed += 1
             continue
 
-        if is_data_row(row.raw, allow_anonymized_prefix=allow_anonymized_prefix):
+        if is_data_row(
+            row.raw,
+            allow_anonymized_prefix=allow_anonymized_prefix,
+            drop_leading_tab=drop_leading_tab,
+        ):
             joined_rows.append(([row.line_number], row.raw, []))
             debug.data_rows_started += 1
             continue
@@ -374,6 +397,7 @@ def parse_document(text: str) -> ParseResult:
             body_rows,
             table_debug,
             allow_anonymized_prefix=allow_anonymized_prefix,
+            drop_leading_tab=drop_leading_tab,
         ):
             cells, cell_issues, short_right_side, used_special_separator_width = parse_cells(
                 raw,

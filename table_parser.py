@@ -10,7 +10,10 @@ from typing import Any
 
 HEADER_PREFIX = "\t Вид"
 DATA_ROW_PREFIX = "РМ"
+ANONYMIZED_DATA_ROW_PREFIX = "AA"
 SPECIAL_SEPARATOR_INDEX = 2
+TABLE_GAP = 4
+MIN_HEADER_TABS = 2
 TAB_RUN_RE = re.compile(r"\t+")
 
 
@@ -87,6 +90,20 @@ def is_header_row(row: PhysicalRow) -> bool:
     return row.raw.startswith(HEADER_PREFIX)
 
 
+def is_data_row(raw: str, allow_anonymized_prefix: bool = False) -> bool:
+    text = raw.lstrip("\t ")
+    return text.startswith(DATA_ROW_PREFIX) or (
+        allow_anonymized_prefix and text.startswith(ANONYMIZED_DATA_ROW_PREFIX)
+    )
+
+
+def is_fallback_header_row(row: PhysicalRow) -> bool:
+    return row.raw.count("\t") >= MIN_HEADER_TABS and not is_data_row(
+        row.raw,
+        allow_anonymized_prefix=True,
+    )
+
+
 def header_parse_text(raw: str) -> str:
     if raw.startswith("\t"):
         return raw[1:]
@@ -106,19 +123,39 @@ def split_tables(
 ) -> list[tuple[PhysicalRow, list[PhysicalRow]]]:
     tables: list[tuple[PhysicalRow, list[PhysicalRow]]] = []
     current: tuple[PhysicalRow, list[PhysicalRow]] | None = None
+    blank_run = 0
 
     for row in rows:
-        if is_header_row(row):
+        if not row.raw.strip():
+            blank_run += 1
+            if current is None:
+                debug.skipped_leading_rows += 1
+            else:
+                current[1].append(row)
+            continue
+
+        starts_table_by_marker = is_header_row(row)
+        starts_first_table_by_shape = current is None and is_fallback_header_row(row)
+        starts_next_table_by_shape = (
+            current is not None
+            and blank_run >= TABLE_GAP
+            and is_fallback_header_row(row)
+        )
+
+        if starts_table_by_marker or starts_first_table_by_shape or starts_next_table_by_shape:
             current = (row, [])
             tables.append(current)
             debug.headers_found += 1
+            blank_run = 0
             continue
 
         if current is None:
             debug.skipped_leading_rows += 1
+            blank_run = 0
             continue
 
         current[1].append(row)
+        blank_run = 0
 
     return tables
 
@@ -185,7 +222,11 @@ def parse_cells(
     raw: str,
     header_width: int,
     separator_widths: list[int],
+    drop_leading_tab: bool = False,
 ) -> tuple[list[str], list[str], bool, bool]:
+    if drop_leading_tab and raw.startswith("\t"):
+        raw = raw[1:]
+
     values, run_widths = tokenize_tab_runs(raw)
     cells = [values[0]]
     separator_index = 0
@@ -239,6 +280,7 @@ def parse_cells(
 def join_data_rows(
     rows: list[PhysicalRow],
     debug: TableDebug,
+    allow_anonymized_prefix: bool = False,
 ) -> list[tuple[list[int], str, list[str]]]:
     joined_rows: list[tuple[list[int], str, list[str]]] = []
 
@@ -247,7 +289,7 @@ def join_data_rows(
             debug.blank_rows_removed += 1
             continue
 
-        if row.raw.startswith(DATA_ROW_PREFIX):
+        if is_data_row(row.raw, allow_anonymized_prefix=allow_anonymized_prefix):
             joined_rows.append(([row.line_number], row.raw, []))
             debug.data_rows_started += 1
             continue
@@ -278,15 +320,22 @@ def parse_document(text: str) -> ParseResult:
 
     for header_row, body_rows in split_tables(rows, debug):
         header, separator_widths = parse_header(header_row.raw)
+        drop_leading_tab = header_row.raw.startswith("\t")
+        allow_anonymized_prefix = not is_header_row(header_row)
         table_debug = TableDebug(physical_rows=1 + len(body_rows))
         table_debug.empty_header_columns = sum(1 for column in header if not column)
         parsed_rows: list[ParsedRow] = []
 
-        for line_numbers, raw, row_issues in join_data_rows(body_rows, table_debug):
+        for line_numbers, raw, row_issues in join_data_rows(
+            body_rows,
+            table_debug,
+            allow_anonymized_prefix=allow_anonymized_prefix,
+        ):
             cells, cell_issues, short_right_side, used_special_separator_width = parse_cells(
                 raw,
                 len(header),
                 separator_widths,
+                drop_leading_tab=drop_leading_tab,
             )
             issues = row_issues + cell_issues
             if short_right_side:

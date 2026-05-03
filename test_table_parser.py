@@ -3,7 +3,7 @@ from importlib.util import find_spec
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from table_parser import parse_document, parse_tables_to_dataframes
+from table_parser import parse_document, parse_tables_to_dataframes, read_table_text
 
 
 class TableParserTests(unittest.TestCase):
@@ -52,6 +52,42 @@ class TableParserTests(unittest.TestCase):
         self.assertEqual(table.rows[2].cells, ["РМ3", "one", "two", "", ""])
         self.assertEqual(table.debug.rows_using_special_separator_width, 1)
         self.assertEqual(table.debug.rows_with_short_right_side, 2)
+
+    def test_parses_anonymized_reference_shape(self) -> None:
+        result = parse_document(read_table_text(Path("table_format.txt")))
+
+        self.assertEqual(len(result.tables), 2)
+        self.assertEqual(result.tables[0].header_line_number, 3)
+        self.assertEqual(result.tables[1].header_line_number, 131)
+        self.assertEqual(len(result.tables[0].rows), 60)
+        self.assertEqual(len(result.tables[1].rows), 6)
+
+    def test_drops_structural_leading_tab_when_parsing_data_cells(self) -> None:
+        result = parse_document(
+            "\n".join(
+                [
+                    "\t H1\tH2\tH3",
+                    "\tAA1\tone\ttwo",
+                ]
+            )
+        )
+
+        self.assertEqual(result.tables[0].header, ["H1", "H2", "H3"])
+        self.assertEqual(result.tables[0].rows[0].cells, ["AA1", "one", "two"])
+
+    def test_anonymized_prefix_does_not_start_real_marker_table_rows(self) -> None:
+        result = parse_document(
+            "\n".join(
+                [
+                    "\t Вид\tA",
+                    "РМ1\tone",
+                    "AA continuation",
+                ]
+            )
+        )
+
+        self.assertEqual(len(result.tables[0].rows), 1)
+        self.assertEqual(result.tables[0].rows[0].line_numbers, [2, 3])
 
     @unittest.skipIf(find_spec("pandas") is None, "pandas is not installed")
     def test_returns_one_dataframe_per_table(self) -> None:

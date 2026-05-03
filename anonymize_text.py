@@ -5,6 +5,10 @@ import base64
 from pathlib import Path
 
 
+def print_preserved_text(text: str) -> None:
+    print(text, end="" if text.endswith("\n") else "\n")
+
+
 def normalize_text(text: str) -> str:
     result = []
 
@@ -19,13 +23,27 @@ def normalize_text(text: str) -> str:
     return "".join(result)
 
 
-def normalize_and_encode(text: str) -> str:
+def encode_normalized_text(normalized_text: str) -> str:
+    return base64.b64encode(normalized_text.encode("utf-8")).decode("ascii")
+
+
+def normalize_and_encode(text: str, print_normalized: bool = True) -> str:
     normalized = normalize_text(text)
-    return base64.b64encode(normalized.encode("utf-8")).decode("ascii")
+    if print_normalized:
+        print_preserved_text(normalized)
+    return encode_normalized_text(normalized)
 
 
-def anonymize_file(input_path: str | Path, output_path: str | Path | None = None) -> str:
-    encoded = normalize_and_encode(Path(input_path).read_text())
+def anonymize_text(text: str, print_normalized: bool = True) -> str:
+    return normalize_and_encode(text, print_normalized=print_normalized)
+
+
+def anonymize_file(
+    input_path: str | Path,
+    output_path: str | Path | None = None,
+    print_normalized: bool = True,
+) -> str:
+    encoded = anonymize_text(Path(input_path).read_text(), print_normalized=print_normalized)
 
     if output_path is not None:
         Path(output_path).write_text(encoded)
